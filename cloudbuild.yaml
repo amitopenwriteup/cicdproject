@@ -24,14 +24,14 @@ steps:
     args: 
       - 'build'
       - '-t'
-      - 'southamerica-east1-docker.pkg.dev/upgradlabs-1738334790345/amit23comp/myapp:$BUILD_ID'
+      - 'us-east1-docker.pkg.dev/openwriteup/cicd/myapp:$BUILD_ID'
       - '.'
   # Step 4: Push Docker image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args: 
       - 'push'
-      - 'southamerica-east1-docker.pkg.dev/upgradlabs-1738334790345/amit23comp/myapp:$BUILD_ID'
+      - 'us-east1-docker.pkg.dev/openwriteup/cicd/myapp:$BUILD_ID'
       
 images:
-  - 'southamerica-east1-docker.pkg.dev/upgradlabs-1738334790345/amit23comp/myapp:$BUILD_ID'
+  - 'us-east1-docker.pkg.dev/openwriteup/cicd/myapp:$BUILD_ID'
 logsBucket: "gs://amit23compow"
