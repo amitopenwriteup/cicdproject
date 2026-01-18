@@ -1,0 +1,87 @@
+pipeline {
+  agent any
+  
+  stages {
+    stage('Install Trivy') {
+      steps {
+        script {
+          // Check if Trivy is already installed
+          def trivyInstalled = sh(script: 'command -v trivy', returnStatus: true)
+          
+          if (trivyInstalled != 0) {
+            echo 'Installing Trivy...'
+            sh '''
+              wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+              echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+              sudo apt-get update
+              sudo apt-get install -y trivy
+            '''
+          } else {
+            echo 'Trivy is already installed'
+          }
+          
+          // Verify installation
+          sh 'trivy --version'
+        }
+      }
+    }
+    
+    stage('Build') {
+      steps {
+        sh 'docker build -t my-flask-app .'
+        sh 'docker tag my-flask-app $DOCKER_BFLASK_IMAGE'
+      }
+    }
+    
+    stage('Trivy Scan') {
+      steps {
+        script {
+          echo 'Running Trivy vulnerability scan...'
+          
+          // Run Trivy scan and capture results
+          def scanResult = sh(
+            script: "trivy image --exit-code 1 --severity HIGH,CRITICAL ${DOCKER_BFLASK_IMAGE} | tee trivy_report.txt",
+            returnStatus: true
+          )
+          
+          // Check scan results
+          if (scanResult == 1) {
+            error "Trivy scan found HIGH/CRITICAL vulnerabilities. Review the 'trivy_report.txt' log for details."
+          } else {
+            echo 'No HIGH/CRITICAL vulnerabilities found!'
+          }
+        }
+      }
+    }
+    
+    stage('Deploy') {
+      steps {
+        withCredentials([usernamePassword(
+          credentialsId: "${DOCKER_REGISTRY_CREDS}",
+          passwordVariable: 'DOCKER_PASSWORD',
+          usernameVariable: 'DOCKER_USERNAME'
+        )]) {
+          sh "echo \$DOCKER_PASSWORD | docker login -u \$DOCKER_USERNAME --password-stdin docker.io"
+          sh 'docker push $DOCKER_BFLASK_IMAGE'
+        }
+      }
+    }
+  }
+  
+  post {
+    always {
+      sh 'docker logout'
+      
+      // Archive the Trivy report
+      archiveArtifacts artifacts: 'trivy_report.txt', allowEmptyArchive: true
+    }
+    
+    success {
+      echo 'Pipeline completed successfully!'
+    }
+    
+    failure {
+      echo 'Pipeline failed. Check logs for details.'
+    }
+  }
+}
