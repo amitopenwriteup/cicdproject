@@ -40,13 +40,13 @@ pipeline {
           
           // Run Trivy scan and capture results
           def scanResult = sh(
-            script: "trivy image --exit-code 1 --severity HIGH,CRITICAL ${DOCKER_BFLASK_IMAGE} | tee trivy_report.txt",
+            script: "trivy image  --exit-code 1 --severity HIGH,CRITICAL -f json -o trivy_report.json ${DOCKER_BFLASK_IMAGE}",
             returnStatus: true
           )
           
           // Check scan results
           if (scanResult == 1) {
-            error "Trivy scan found HIGH/CRITICAL vulnerabilities. Review the 'trivy_report.txt' log for details."
+            error "Trivy scan found HIGH/CRITICAL vulnerabilities. Review the 'trivy_report.json' log for details."
           } else {
             echo 'No HIGH/CRITICAL vulnerabilities found!'
           }
@@ -73,7 +73,7 @@ pipeline {
       sh 'docker logout'
       
       // Archive the Trivy report
-      archiveArtifacts artifacts: 'trivy_report.txt', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'trivy_report.json', allowEmptyArchive: true
     }
     
     success {
