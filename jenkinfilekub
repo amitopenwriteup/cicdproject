@@ -1,51 +1,385 @@
- def dockerfile = 'dockerfile'
- def registry = 'localhost:5000'
- def imageName = 'myimage'
- def imageTag = 'latest'
- def manifestFile = 'kubernetes-manifest.yaml'
- def namespace = 'default'
- def IMAGE_BRANCH_TAG = "${registry}/${imageName}:${imageTag}"
+// ═══════════════════════════════════════════════════════════════════
+//  Jenkinsfile — CI/CD with Local Ollama AI Agent
+//  Stack  : Jenkins + Docker + Kind (Kubernetes)
+//  AI     : Ollama (100% local, FREE, no API key needed)
+//  Stages : Checkout → Test → Docker → AI Review →
+//           AI Security → AI Decision → K8s Deploy → Smoke Test
+// ═══════════════════════════════════════════════════════════════════
+
 pipeline {
     agent any
-    
-    // Define variables at the top level
-//    def dockerfile = 'dockerfile'
-  //  def registry = 'localhost:5000'
-    // def imageName = 'myimage'
-    // def imageTag = 'latest'
-    // def manifestFile = 'k8s-deployment.yaml'
-    // def namespace = 'default'
-    
+
+    // ── Parameters ────────────────────────────────────────────────
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Target Kubernetes namespace: workshop-<env>'
+        )
+        choice(
+            name: 'OLLAMA_MODEL',
+            choices: ['llama3.2:1b', 'llama3.2:1b', 'codellama:7b', 'mistral:7b'],
+            description: 'Ollama model to use for AI review'
+        )
+        booleanParam(
+            name: 'SKIP_AI',
+            defaultValue: false,
+            description: 'Skip all AI stages (emergency deploy)'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip unit tests (emergency only)'
+        )
+        booleanParam(
+            name: 'AI_BLOCK_ON_REJECT',
+            defaultValue: true,
+            description: 'Block pipeline if AI rejects? Uncheck for demo passthrough'
+        )
+    }
+
+    // ── Environment Variables ──────────────────────────────────────
+    environment {
+        // 🔧 Change these to match your setup
+        DOCKER_IMAGE  = "amitow/workshop-app"
+        K8S_NAMESPACE = "workshop-${params.DEPLOY_ENV}"
+        DOCKER_TAG    = "${env.BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+
+        // Ollama settings — pulled from Jenkins credential
+        OLLAMA_MODEL  = "${params.OLLAMA_MODEL}"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        skipDefaultCheckout(false)
+    }
+
+    // ══════════════════════════════════════════════════════════════
     stages {
-        stage('Checkout the Git repository') {
+
+        // ─────────────────────────────────────────────────────────
+        stage('🔍 Checkout') {
             steps {
-                git branch: 'master', url: 'https://github.com/amitopenwriteup/cicd.git'
+                checkout scm
+                sh '''
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo " Branch : $(git branch --show-current)"
+                    echo " Commit : $(git log -1 --oneline)"
+                    echo " Author : $(git log -1 --format='%an <%ae>')"
+                    echo " Files  : $(git show --stat HEAD | tail -1)"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                '''
             }
         }
-        stage('Build Docker image') {
+
+        // ─────────────────────────────────────────────────────────
+        stage('🧪 Unit Tests') {
+            when { expression { !params.SKIP_TESTS } }
             steps {
-                script {
-                    def dockerImage = docker.build("${registry}/${imageName}:${imageTag}", "-f ${dockerfile} .")
-                    dockerImage.push()
+                sh '''
+                    echo "Running unit tests..."
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r app/requirements.txt -q
+                    mkdir -p test-results
+                    pytest app/tests/ -v \
+                        --junitxml=test-results/results.xml \
+                        --tb=short
+                    echo "✅ Tests complete"
+                '''
+            }
+            post {
+                always {
+                    junit allowEmptyResults: true,
+                          testResults: 'test-results/results.xml'
+                }
+                failure {
+                    echo "❌ Unit tests failed — fix tests before deploying!"
                 }
             }
         }
-        stage('Apply Kubernetes manifest') {
-         steps {
-          withCredentials([file(credentialsId: '9445dd9b-e604-40cd-a802-79f747011ecb', variable: 'KUBECONFIG')])
-         {
-            script {
-                sh """
-                sed \
-                    -e "s|{{NAMESPACE}}|${namespace}|g" \
-                    -e "s|{{PULL_IMAGE}}|${IMAGE_BRANCH_TAG}|g" \
-                    ${manifestFile} \
-                | kubectl apply -f -
-                """
+
+        // ─────────────────────────────────────────────────────────
+        stage('🐳 Docker Build & Push') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'docker-hub-creds',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo " Building: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        docker build \
+                            --build-arg BUILD_NUMBER=${BUILD_NUMBER} \
+                            --label "git.commit=${GIT_COMMIT}" \
+                            --label "jenkins.build=${BUILD_NUMBER}" \
+                            -t ${DOCKER_IMAGE}:${DOCKER_TAG} \
+                            -t ${DOCKER_IMAGE}:${DEPLOY_ENV}-latest \
+                            .
+
+                        echo "${DOCKER_PASS}" | docker login \
+                            -u "${DOCKER_USER}" --password-stdin
+
+                        docker push ${DOCKER_IMAGE}:${DOCKER_TAG}
+                        docker push ${DOCKER_IMAGE}:${DEPLOY_ENV}-latest
+
+                        docker logout
+                        echo "✅ Image pushed: ${DOCKER_IMAGE}:${DOCKER_TAG}"
+                    '''
+                }
             }
         }
-    }
-}
 
- }
+        // ─────────────────────────────────────────────────────────
+        // AI STAGES — all run the ollama_agent.py script once,
+        // parse the single ai_report.json for each check
+        // ─────────────────────────────────────────────────────────
+
+        stage('🦙 Ollama AI Analysis') {
+            when { expression { !params.SKIP_AI } }
+            steps {
+                withCredentials([string(
+                    credentialsId: 'ollama-host',
+                    variable: 'OLLAMA_HOST'
+                )]) {
+                    script {
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo " 🦙 Running Ollama AI Agent"
+                        echo " Host  : ${env.OLLAMA_HOST}"
+                        echo " Model : ${params.OLLAMA_MODEL}"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        // Run the full AI agent (all 3 stages in one call)
+                        def exitCode = sh(
+                            script: """
+                                OLLAMA_HOST=${env.OLLAMA_HOST} \
+                                OLLAMA_MODEL=${params.OLLAMA_MODEL} \
+                                python3 ai-agent/ollama_agent.py \
+                                    --path app/ \
+                                    --environment ${params.DEPLOY_ENV} \
+                                    --output ai_report.json
+                            """,
+                            returnStatus: true
+                        )
+
+                        // Parse the full report
+                        def report = readJSON file: 'ai_report.json'
+
+                        // ── Code Review Results ──────────────────
+                        def score = report.score ?: report.code_review?.score ?: 5
+                        def grade = report.code_review?.grade ?: 'N/A'
+                        echo """
+╔══════════════════════════════════════════╗
+║   📋 CODE REVIEW                         ║
+╠══════════════════════════════════════════╣
+║  Score   : ${score}/10  (Grade: ${grade})
+║  Summary : ${report.summary ?: 'N/A'}
+╚══════════════════════════════════════════╝"""
+
+                        // ── Security Scan Results ────────────────
+                        def risk    = report.risk_level ?: report.security_scan?.risk_level ?: 'UNKNOWN'
+                        def blocked = report.security_scan?.block_deployment ?: false
+                        echo """
+╔══════════════════════════════════════════╗
+║   🔒 SECURITY SCAN                       ║
+╠══════════════════════════════════════════╣
+║  Risk Level : ${risk}
+║  Blocked    : ${blocked}
+║  Secrets    : ${report.security_scan?.secrets_found ?: false}
+╚══════════════════════════════════════════╝"""
+
+                        // ── Deploy Decision Results ──────────────
+                        def decision   = report.decision ?: report.deploy_decision?.decision ?: 'APPROVE'
+                        def confidence = report.deploy_decision?.confidence ?: 'N/A'
+                        def reason     = report.deploy_decision?.reason ?: 'N/A'
+                        echo """
+╔══════════════════════════════════════════╗
+║   🚦 DEPLOY DECISION                     ║
+╠══════════════════════════════════════════╣
+║  Decision   : ${decision}
+║  Confidence : ${confidence}%
+║  Reason     : ${reason?.take(50)}
+╚══════════════════════════════════════════╝"""
+
+                        // ── Gate Logic ───────────────────────────
+                        if (params.AI_BLOCK_ON_REJECT) {
+
+                            // Hard block: CRITICAL security or secrets
+                            if (risk == 'CRITICAL') {
+                                error("🚨 CRITICAL security risk! Deployment blocked by AI.")
+                            }
+                            if (report.security_scan?.secrets_found == true) {
+                                error("🚨 Secrets found in code! Deployment blocked.")
+                            }
+
+                            // Prod-only blocks
+                            if (params.DEPLOY_ENV == 'prod') {
+                                if (risk == 'HIGH') {
+                                    error("🚨 HIGH security risk — production deploy blocked!")
+                                }
+                                if (score < 5) {
+                                    error("❌ Code quality score ${score}/10 too low for production!")
+                                }
+                                if (decision == 'REJECT') {
+                                    error("🚫 AI Agent rejected production deployment!\n${reason}")
+                                }
+                            }
+
+                            // Warnings for non-prod
+                            if (decision == 'REJECT' && params.DEPLOY_ENV != 'prod') {
+                                unstable("⚠️  AI recommends not deploying — proceeding to ${params.DEPLOY_ENV} anyway")
+                            }
+                            if (score < 6) {
+                                unstable("⚠️  Code quality score ${score}/10 — consider fixing before prod")
+                            }
+
+                        } else {
+                            echo "ℹ️  AI_BLOCK_ON_REJECT=false — AI result is advisory only"
+                        }
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('🚀 Deploy to Kubernetes') {
+            steps {
+                withCredentials([file(
+                    credentialsId: 'kubeconfig',
+                    variable: 'KUBECONFIG'
+                )]) {
+                    sh '''
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo " Deploying to: ${K8S_NAMESPACE}"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        # Create namespace if it does not exist
+                        kubectl get namespace ${K8S_NAMESPACE} 2>/dev/null \
+                            || kubectl create namespace ${K8S_NAMESPACE}
+
+                        # Apply all manifests in k8s/
+                        kubectl apply -f k8s/ -n ${K8S_NAMESPACE}
+
+                        # Update the running image to the exact tag we built
+                        kubectl set image deployment/workshop-app \
+                            workshop-app=${DOCKER_IMAGE}:${DOCKER_TAG} \
+                            -n ${K8S_NAMESPACE}
+
+                        # Stamp metadata onto the deployment
+                        kubectl annotate deployment/workshop-app \
+                            jenkins.build="${BUILD_NUMBER}" \
+                            git.commit="${GIT_COMMIT}" \
+                            deployed.at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                            -n ${K8S_NAMESPACE} --overwrite
+
+                        # Block until rollout completes (or 5m timeout)
+                        kubectl rollout status deployment/workshop-app \
+                            -n ${K8S_NAMESPACE} \
+                            --timeout=5m
+
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo " Pods after deploy:"
+                        kubectl get pods -n ${K8S_NAMESPACE} \
+                            -l app=workshop-app \
+                            -o wide
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    '''
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────
+        stage('✅ Smoke Tests') {
+            steps {
+                withCredentials([file(
+                    credentialsId: 'kubeconfig',
+                    variable: 'KUBECONFIG'
+                )]) {
+                    sh '''
+                        echo "Running smoke tests against ${K8S_NAMESPACE}..."
+
+                        # Start port-forward in background
+                        kubectl port-forward svc/workshop-app-svc 9977:80 \
+                            -n ${K8S_NAMESPACE} &
+                        PF_PID=$!
+
+                        # Wait for port-forward to be ready
+                        sleep 6
+
+                        FAIL=0
+
+                        # Test 1: Health endpoint
+                        curl -sf http://localhost:9977/health \
+                            && echo "✅ /health → 200 OK" \
+                            || { echo "❌ /health → FAILED"; FAIL=1; }
+
+                        # Test 2: Readiness endpoint
+                        curl -sf http://localhost:9977/ready \
+                            && echo "✅ /ready  → 200 OK" \
+                            || { echo "❌ /ready  → FAILED"; FAIL=1; }
+
+                        # Test 3: Root endpoint
+                        curl -sf http://localhost:9977/ \
+                            && echo "✅ /       → 200 OK" \
+                            || { echo "❌ /       → FAILED"; FAIL=1; }
+
+                        # Cleanup port-forward
+                        kill $PF_PID 2>/dev/null || true
+                        wait  $PF_PID 2>/dev/null || true
+
+                        if [ $FAIL -ne 0 ]; then
+                            echo "❌ Smoke tests failed!"
+                            exit 1
+                        fi
+                        echo "✅ All smoke tests passed!"
+                    '''
+                }
+            }
+        }
+
+    }
+    // ══════════════════════════════════════════════════════════════
+
+    // ── Post Actions ──────────────────────────────────────────────
+    post {
+        success {
+            echo """
+╔══════════════════════════════════════════════════════╗
+║  ✅  PIPELINE SUCCEEDED                              ║
+╠══════════════════════════════════════════════════════╣
+║  Image     : ${DOCKER_IMAGE}:${DOCKER_TAG}
+║  Namespace : ${K8S_NAMESPACE}
+║  Build     : #${BUILD_NUMBER}
+║  AI Model  : ${params.OLLAMA_MODEL}
+╚══════════════════════════════════════════════════════╝"""
+        }
+
+        failure {
+            echo "❌ Pipeline failed — triggering auto-rollback..."
+            withCredentials([file(
+                credentialsId: 'kubeconfig',
+                variable: 'KUBECONFIG'
+            )]) {
+                sh '''
+                    kubectl rollout undo deployment/workshop-app \
+                        -n ${K8S_NAMESPACE} 2>/dev/null \
+                        && echo "🔄 Rollback complete" \
+                        || echo "⚠️  Rollback skipped (deploy may not have started)"
+                '''
+            }
+        }
+
+        always {
+            // Archive the AI report as a Jenkins build artifact
+            archiveArtifacts artifacts: 'ai_report.json',
+                             allowEmptyArchive: true
+            cleanWs()
+        }
+    }
 }
